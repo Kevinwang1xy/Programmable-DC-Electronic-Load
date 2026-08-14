@@ -1,0 +1,1 @@
+This is the C code used to control the Arduino-NANO-ESP32 Microcontroller. Alongside the ESP32, this project also integrates a MCP4725 DAC, a OLED Display module, and a raw rotary encoder, all of which are connected and controlled through the ESP32. 
