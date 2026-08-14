@@ -1,0 +1,271 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MCP4725.h>
+
+// -------------------- OLED --------------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// -------------------- DAC --------------------
+#define DAC_ADDR 0x60
+Adafruit_MCP4725 dac;
+
+// -------------------- I2C Pins --------------------
+#define SDA_PIN A4
+#define SCL_PIN A5
+
+// -------------------- Rotary Encoder Pins --------------------
+#define ENC_A  D2
+#define ENC_B  D3
+#define ENC_SW D4
+
+// -------------------- Electronic Load Settings --------------------
+const float DAC_SUPPLY_V = 3.3;
+const float R_SENSE = 1.0;
+
+// Your current divider:
+// DAC OUT -> R_TOP -> Vref node -> R_BOTTOM -> GND
+// Right now using 1000 ohm top, 100 ohm bottom.
+// Later we can replace these with your measured exact values.
+const float R_TOP = 1000.0;
+const float R_BOTTOM = 100.0;
+const float DIVIDER_RATIO = R_BOTTOM / (R_TOP + R_BOTTOM);
+
+// Safe bring-up range with 1k/100 divider:
+// 3.3V DAC max -> about 0.30V Vref -> about 0.30A
+const float MAX_CURRENT_A = 0.30;
+const float CURRENT_STEP_A = 0.01;   // 10 mA per click
+
+float targetCurrent_A = 0.00;
+bool loadEnabled = false;
+
+// -------------------- Encoder State --------------------
+int lastEncoded = 0;
+int encoderAccumulator = 0;
+
+// Try 4 first. If the knob feels too insensitive, change this to 2.
+// If it becomes too jumpy, change it back to 4.
+const int ENCODER_COUNTS_PER_STEP = 4;
+
+// Quadrature transition table
+// This filters invalid/bouncy transitions better than the simple CLK-only method.
+const int8_t encoderTable[16] = {
+  0, -1,  1,  0,
+  1,  0,  0, -1,
+ -1,  0,  0,  1,
+  0,  1, -1,  0
+};
+
+// -------------------- Button Debounce --------------------
+bool buttonStableState = HIGH;
+bool lastButtonReading = HIGH;
+unsigned long lastButtonChangeTime = 0;
+const unsigned long buttonDebounceMs = 200;
+
+// -------------------- Display Timing --------------------
+unsigned long lastDisplayUpdate = 0;
+const unsigned long displayUpdateMs = 100;
+
+// -------------------- Last command values for display --------------------
+float commandedVref = 0.0;
+float commandedDacVoltage = 0.0;
+uint16_t commandedDacCode = 0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  setupEncoder();
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED init failed");
+    while (1);
+  }
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Starting...");
+  display.display();
+
+  // DAC init
+  if (!dac.begin(DAC_ADDR)) {
+    Serial.println("MCP4725 DAC not found");
+
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("DAC NOT FOUND");
+    display.display();
+
+    while (1);
+  }
+
+  Serial.println("OLED and MCP4725 initialized.");
+  Serial.println("Rotary encoder initialized.");
+
+  // Start with load OFF and DAC at 0
+  writeCurrentCommand(0.0);
+  updateDisplay();
+}
+
+void loop() {
+  handleEncoder();
+  handleButton();
+
+  if (loadEnabled) {
+    writeCurrentCommand(targetCurrent_A);
+  } else {
+    writeCurrentCommand(0.0);
+  }
+
+  if (millis() - lastDisplayUpdate >= displayUpdateMs) {
+    updateDisplay();
+    lastDisplayUpdate = millis();
+  }
+}
+
+// -------------------- Encoder Setup --------------------
+void setupEncoder() {
+  pinMode(ENC_A, INPUT_PULLUP);
+  pinMode(ENC_B, INPUT_PULLUP);
+  pinMode(ENC_SW, INPUT_PULLUP);
+
+  int a = digitalRead(ENC_A);
+  int b = digitalRead(ENC_B);
+
+  lastEncoded = (a << 1) | b;
+}
+
+// -------------------- Better Encoder Handling --------------------
+void handleEncoder() {
+  int a = digitalRead(ENC_A);
+  int b = digitalRead(ENC_B);
+
+  int encoded = (a << 1) | b;
+  int transition = (lastEncoded << 2) | encoded;
+
+  int movement = encoderTable[transition];
+
+  if (movement != 0) {
+    encoderAccumulator += movement;
+
+    if (encoderAccumulator >= ENCODER_COUNTS_PER_STEP) {
+      targetCurrent_A += CURRENT_STEP_A;
+      encoderAccumulator -= ENCODER_COUNTS_PER_STEP;
+      clampCurrent();
+      printTargetCurrent();
+    } 
+    else if (encoderAccumulator <= -ENCODER_COUNTS_PER_STEP) {
+      targetCurrent_A -= CURRENT_STEP_A;
+      encoderAccumulator += ENCODER_COUNTS_PER_STEP;
+      clampCurrent();
+      printTargetCurrent();
+    }
+  }
+
+  lastEncoded = encoded;
+}
+
+void clampCurrent() {
+  if (targetCurrent_A < 0.0) {
+    targetCurrent_A = 0.0;
+  }
+
+  if (targetCurrent_A > MAX_CURRENT_A) {
+    targetCurrent_A = MAX_CURRENT_A;
+  }
+}
+
+void printTargetCurrent() {
+  Serial.print("Target current: ");
+  Serial.print(targetCurrent_A, 3);
+  Serial.println(" A");
+}
+
+// -------------------- Button Handling --------------------
+void handleButton() {
+  bool reading = digitalRead(ENC_SW);
+
+  if (reading != lastButtonReading) {
+    lastButtonChangeTime = millis();
+    lastButtonReading = reading;
+  }
+
+  if ((millis() - lastButtonChangeTime) > buttonDebounceMs) {
+    if (reading != buttonStableState) {
+      buttonStableState = reading;
+
+      if (buttonStableState == LOW) {
+        loadEnabled = !loadEnabled;
+
+        Serial.print("Load: ");
+        Serial.println(loadEnabled ? "ON" : "OFF");
+      }
+    }
+  }
+}
+
+// -------------------- DAC Command --------------------
+void writeCurrentCommand(float current_A) {
+  // Desired Vref at LM324 positive input
+  float vrefTarget = current_A * R_SENSE;
+
+  // Because of the divider, DAC OUT must be higher than Vref node
+  float dacVoltage = vrefTarget / DIVIDER_RATIO;
+
+  if (dacVoltage < 0.0) {
+    dacVoltage = 0.0;
+  }
+
+  if (dacVoltage > DAC_SUPPLY_V) {
+    dacVoltage = DAC_SUPPLY_V;
+  }
+
+  uint16_t dacCode = (uint16_t)((dacVoltage / DAC_SUPPLY_V) * 4095.0);
+
+  dac.setVoltage(dacCode, false);
+
+  commandedVref = dacVoltage * DIVIDER_RATIO;
+  commandedDacVoltage = dacVoltage;
+  commandedDacCode = dacCode;
+}
+
+// -------------------- OLED Display --------------------
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.println("DC Electronic Load");
+
+  display.setCursor(0, 13);
+  display.print("LOAD: ");
+  display.println(loadEnabled ? "ON" : "OFF");
+
+  display.setCursor(0, 25);
+  display.print("Set I: ");
+  display.print(targetCurrent_A, 3);
+  display.println(" A");
+
+  display.setCursor(0, 37);
+  display.print("Vref:  ");
+  display.print(commandedVref, 3);
+  display.println(" V");
+
+  display.setCursor(0, 49);
+  display.print("DAC:   ");
+  display.print(commandedDacVoltage, 3);
+  display.println(" V");
+
+  display.display();
+}
