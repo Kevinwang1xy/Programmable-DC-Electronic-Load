@@ -1,0 +1,433 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MCP4725.h>
+
+// -------------------- OLED --------------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDR 0x3C
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// -------------------- DAC --------------------
+#define DAC_ADDR 0x60
+Adafruit_MCP4725 dac;
+
+// -------------------- I2C Pins --------------------
+#define SDA_PIN A4
+#define SCL_PIN A5
+
+// -------------------- Rotary Encoder Pins --------------------
+#define ENC_A  D2
+#define ENC_B  D3
+#define ENC_SW D4
+
+// -------------------- ADC Pins --------------------
+// A0: MOSFET drain / battery positive directly
+// A1: top of Rsense / LM324 negative input
+#define BATTERY_ADC_PIN A0
+#define SENSE_ADC_PIN   A1
+
+// -------------------- ADC Settings --------------------
+const float ADC_REF_V = 3.3;
+const int ADC_MAX_COUNTS = 4095;
+
+// Calibration factors.
+// Leave at 1.0 first. Adjust later if OLED does not match multimeter.
+const float BATTERY_CAL = 1.0;
+const float SENSE_CAL   = 1.0;
+
+// -------------------- Electronic Load Settings --------------------
+const float DAC_SUPPLY_V = 3.3;
+const float R_SENSE = 1.0;
+
+// Vref divider:
+// DAC OUT -> 10k -> Vref node -> 1k -> GND
+const float R_TOP = 10000.0;
+const float R_BOTTOM = 1000.0;
+const float DIVIDER_RATIO = R_BOTTOM / (R_TOP + R_BOTTOM);
+
+// Safe current range with this divider:
+// DAC max 3.3V -> Vref max about 0.30V -> I max about 0.30A
+const float MAX_CURRENT_A = 0.30;
+const float CURRENT_STEP_A = 0.01;
+
+float targetCurrent_A = 0.00;
+bool loadEnabled = false;
+
+// -------------------- Interrupt Encoder State --------------------
+volatile int encoderDelta = 0;
+volatile int lastEncoded = 0;
+
+// Start with 1 for maximum responsiveness.
+// If it becomes too jumpy, change this to 2 or 4.
+const int ENCODER_COUNTS_PER_STEP = 1;
+
+int encoderAccumulator = 0;
+
+const int8_t encoderTable[16] = {
+  0, -1,  1,  0,
+  1,  0,  0, -1,
+ -1,  0,  0,  1,
+  0,  1, -1,  0
+};
+
+// Function prototype for interrupt routine
+void IRAM_ATTR encoderISR();
+
+// -------------------- Button Debounce --------------------
+bool buttonStableState = HIGH;
+bool lastButtonReading = HIGH;
+unsigned long lastButtonChangeTime = 0;
+const unsigned long buttonDebounceMs = 200;
+
+// -------------------- Display Timing --------------------
+unsigned long lastDisplayUpdate = 0;
+const unsigned long displayUpdateMs = 150;
+
+// -------------------- Commanded Values --------------------
+float commandedVref = 0.0;
+float commandedDacVoltage = 0.0;
+uint16_t commandedDacCode = 0;
+
+// -------------------- Measured Values --------------------
+float batteryVoltage_V = 0.0;
+float senseVoltage_V = 0.0;
+float measuredCurrent_A = 0.0;
+float noLoadVoltage_V = 0.0;
+float voltageSag_V = 0.0;
+float batteryPower_W = 0.0;
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(100000);
+
+  setupEncoder();
+
+  analogReadResolution(12);
+  pinMode(BATTERY_ADC_PIN, INPUT);
+  pinMode(SENSE_ADC_PIN, INPUT);
+
+  // OLED init
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED init failed");
+    while (1);
+  }
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Starting...");
+  display.display();
+
+  // DAC init
+  if (!dac.begin(DAC_ADDR)) {
+    Serial.println("MCP4725 DAC not found");
+
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("DAC NOT FOUND");
+    display.display();
+
+    while (1);
+  }
+
+  Serial.println("OLED and MCP4725 initialized.");
+  Serial.println("Interrupt encoder initialized.");
+
+  // Start load off
+  writeCurrentCommand(0.0);
+  readMeasurements();
+  noLoadVoltage_V = batteryVoltage_V;
+
+  updateDisplay();
+}
+
+void loop() {
+  handleEncoder();
+  handleButton();
+
+  if (loadEnabled) {
+    writeCurrentCommand(targetCurrent_A);
+  } else {
+    writeCurrentCommand(0.0);
+  }
+
+  readMeasurements();
+
+  if (millis() - lastDisplayUpdate >= displayUpdateMs) {
+    updateDisplay();
+    printSerialData();
+    lastDisplayUpdate = millis();
+  }
+}
+
+// -------------------- Encoder Setup --------------------
+void setupEncoder() {
+  pinMode(ENC_A, INPUT_PULLUP);
+  pinMode(ENC_B, INPUT_PULLUP);
+  pinMode(ENC_SW, INPUT_PULLUP);
+
+  int a = digitalRead(ENC_A);
+  int b = digitalRead(ENC_B);
+  lastEncoded = (a << 1) | b;
+
+  attachInterrupt(ENC_A, encoderISR, CHANGE);
+  attachInterrupt(ENC_B, encoderISR, CHANGE);
+}
+
+// -------------------- Encoder Interrupt --------------------
+void IRAM_ATTR encoderISR() {
+  int a = digitalRead(ENC_A);
+  int b = digitalRead(ENC_B);
+
+  int encoded = (a << 1) | b;
+  int transition = (lastEncoded << 2) | encoded;
+
+  int movement = encoderTable[transition];
+
+  if (movement != 0) {
+    encoderDelta += movement;
+  }
+
+  lastEncoded = encoded;
+}
+
+// -------------------- Encoder Handling --------------------
+void handleEncoder() {
+  int deltaCopy = 0;
+
+  noInterrupts();
+  deltaCopy = encoderDelta;
+  encoderDelta = 0;
+  interrupts();
+
+  if (deltaCopy != 0) {
+    encoderAccumulator += deltaCopy;
+
+    while (encoderAccumulator >= ENCODER_COUNTS_PER_STEP) {
+      targetCurrent_A += CURRENT_STEP_A;
+      encoderAccumulator -= ENCODER_COUNTS_PER_STEP;
+      clampCurrent();
+    }
+
+    while (encoderAccumulator <= -ENCODER_COUNTS_PER_STEP) {
+      targetCurrent_A -= CURRENT_STEP_A;
+      encoderAccumulator += ENCODER_COUNTS_PER_STEP;
+      clampCurrent();
+    }
+
+    Serial.print("Target current: ");
+    Serial.print(targetCurrent_A, 3);
+    Serial.println(" A");
+  }
+}
+
+void clampCurrent() {
+  if (targetCurrent_A < 0.0) {
+    targetCurrent_A = 0.0;
+  }
+
+  if (targetCurrent_A > MAX_CURRENT_A) {
+    targetCurrent_A = MAX_CURRENT_A;
+  }
+}
+
+// -------------------- Button Handling --------------------
+void handleButton() {
+  bool reading = digitalRead(ENC_SW);
+
+  if (reading != lastButtonReading) {
+    lastButtonChangeTime = millis();
+    lastButtonReading = reading;
+  }
+
+  if ((millis() - lastButtonChangeTime) > buttonDebounceMs) {
+    if (reading != buttonStableState) {
+      buttonStableState = reading;
+
+      if (buttonStableState == LOW) {
+        loadEnabled = !loadEnabled;
+
+        // When turning load ON, capture the no-load battery voltage.
+        if (loadEnabled) {
+          readMeasurements();
+          noLoadVoltage_V = batteryVoltage_V;
+        }
+
+        Serial.print("Load: ");
+        Serial.println(loadEnabled ? "ON" : "OFF");
+      }
+    }
+  }
+}
+
+// -------------------- DAC Command --------------------
+void writeCurrentCommand(float current_A) {
+  // Desired Vref at LM324 positive input
+  float vrefTarget = current_A * R_SENSE;
+
+  // DAC output must be higher because of divider
+  float dacVoltage = vrefTarget / DIVIDER_RATIO;
+
+  if (dacVoltage < 0.0) {
+    dacVoltage = 0.0;
+  }
+
+  if (dacVoltage > DAC_SUPPLY_V) {
+    dacVoltage = DAC_SUPPLY_V;
+  }
+
+  uint16_t dacCode = (uint16_t)((dacVoltage / DAC_SUPPLY_V) * 4095.0);
+
+  dac.setVoltage(dacCode, false);
+
+  commandedVref = dacVoltage * DIVIDER_RATIO;
+  commandedDacVoltage = dacVoltage;
+  commandedDacCode = dacCode;
+}
+
+// -------------------- ADC Reading Helpers --------------------
+float readAdcVoltage(int pin) {
+  const int samples = 16;
+  long sum = 0;
+
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(100);
+  }
+
+  float adcCounts = sum / (float)samples;
+  float adcVoltage = (adcCounts / ADC_MAX_COUNTS) * ADC_REF_V;
+
+  return adcVoltage;
+}
+
+float readBatteryVoltage() {
+  // Direct measurement:
+  // MOSFET drain / battery positive -> A0
+  // Only safe for sources below 3.3V.
+  float batteryVoltage = readAdcVoltage(BATTERY_ADC_PIN);
+  batteryVoltage *= BATTERY_CAL;
+
+  return batteryVoltage;
+}
+
+float readSenseVoltage() {
+  // Direct measurement:
+  // top of 1Ω Rsense / LM324 pin 2 -> A1
+  float senseVoltage = readAdcVoltage(SENSE_ADC_PIN);
+  senseVoltage *= SENSE_CAL;
+
+  return senseVoltage;
+}
+
+void readMeasurements() {
+  batteryVoltage_V = readBatteryVoltage();
+  senseVoltage_V = readSenseVoltage();
+
+  measuredCurrent_A = senseVoltage_V / R_SENSE;
+
+  // When load is off, continuously update no-load baseline.
+  // When load turns on, noLoadVoltage freezes.
+  if (!loadEnabled) {
+    noLoadVoltage_V = batteryVoltage_V;
+  }
+
+  voltageSag_V = noLoadVoltage_V - batteryVoltage_V;
+
+  if (voltageSag_V < 0.0) {
+    voltageSag_V = 0.0;
+  }
+
+  batteryPower_W = batteryVoltage_V * measuredCurrent_A;
+}
+
+// -------------------- OLED Display --------------------
+void updateDisplay() {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.print("LOAD:");
+  display.print(loadEnabled ? "ON " : "OFF");
+  display.print(" Set:");
+  display.print(targetCurrent_A, 2);
+  display.println("A");
+
+  display.setCursor(0, 11);
+  display.print("Itrue: ");
+  display.print(measuredCurrent_A, 3);
+  display.println(" A");
+
+  display.setCursor(0, 22);
+  display.print("Vbat:  ");
+  display.print(batteryVoltage_V, 3);
+  display.println(" V");
+
+  display.setCursor(0, 33);
+  display.print("Sag:   ");
+  display.print(voltageSag_V, 3);
+  display.println(" V");
+
+  display.setCursor(0, 44);
+  display.print("Pbat:  ");
+  display.print(batteryPower_W, 3);
+  display.println(" W");
+
+  display.setCursor(0, 55);
+  display.print("Vs:");
+  display.print(senseVoltage_V, 3);
+  display.print(" Vr:");
+  display.print(commandedVref, 3);
+
+  display.display();
+}
+
+// -------------------- Serial Debug --------------------
+void printSerialData() {
+  Serial.print("LOAD=");
+  Serial.print(loadEnabled ? "ON" : "OFF");
+
+  Serial.print(" | SetI=");
+  Serial.print(targetCurrent_A, 3);
+  Serial.print(" A");
+
+  Serial.print(" | Itrue=");
+  Serial.print(measuredCurrent_A, 3);
+  Serial.print(" A");
+
+  Serial.print(" | Vbat=");
+  Serial.print(batteryVoltage_V, 3);
+  Serial.print(" V");
+
+  Serial.print(" | NoLoad=");
+  Serial.print(noLoadVoltage_V, 3);
+  Serial.print(" V");
+
+  Serial.print(" | Sag=");
+  Serial.print(voltageSag_V, 3);
+  Serial.print(" V");
+
+  Serial.print(" | Pbat=");
+  Serial.print(batteryPower_W, 3);
+  Serial.print(" W");
+
+  Serial.print(" | Vsense=");
+  Serial.print(senseVoltage_V, 3);
+  Serial.print(" V");
+
+  Serial.print(" | VrefCmd=");
+  Serial.print(commandedVref, 3);
+  Serial.print(" V");
+
+  Serial.print(" | DAC=");
+  Serial.print(commandedDacVoltage, 3);
+  Serial.println(" V");
+}
