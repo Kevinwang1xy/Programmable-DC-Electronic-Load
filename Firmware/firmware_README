@@ -1,0 +1,1 @@
+This folder contains the C code that designs the user interface portion of the poject. It is uploaded to the ESP32 Microcontroller via the Arduino IDE. The following libraries are downloaded in the IDE for the project: Adafruit GFX library, Adafruit SSD1306, Adafruit MCP4725, Adafruit BusIO. 
