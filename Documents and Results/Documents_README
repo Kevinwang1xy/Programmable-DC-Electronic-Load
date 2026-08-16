@@ -1,5 +1,3 @@
-This folder holds all testing and simulation results as well as the circuit schematic for the project. The schematic shows only the portion 
-of the circuit that directly controls load. The user interface portion, including the ESP32 and its I2C components, are not simulated. The 
-Simulation result, with a time stamp of 0-5s showed correct voltage and current values across all reference points. 
+This folder contains testing and simulation results, circuit schematic, and the physical board of the project. 
 
 
