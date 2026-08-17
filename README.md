@@ -15,4 +15,4 @@ This voltage-to-current conversion is maintained by the 1 ohm sense resistor in 
   
 
 
-[Demo Video](https://drive.google.com/file/d/1uX11_nZpo1H0H63yr_2g6Bv6h3FJr6_b/view?usp=drive_link)
+[Watch the demo video](https://drive.google.com/file/d/1uX11_nZpo1H0H63yr_2g6Bv6h3FJr6_b/view?usp=drive_link)
