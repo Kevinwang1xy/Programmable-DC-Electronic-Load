@@ -1,6 +1,9 @@
 # Programmable-DC-Electronic-Load
 
 
+[Demo Video]: https://drive.google.com/file/d/1uX11_nZpo1H0H63yr_2g6Bv6h3FJr6_b/view?usp=drive_link
+
+
 
 The electric power source is one of the most fundamental aspects of any engineering product or project, and often one of the most overlooked. Whether complicated or simple, any product that uses DC power requires a stable and efficient power source. However, in many cases, engineers have no easy way to test exactly how a DC power source will behave under specific load conditions relevant to their project until the product is complete. This programmable DC electronic load project serves to resolve this issue proactively by allowing the engineer to confirm power source behavior under realistic conditions before integrating it into a larger system.
 
